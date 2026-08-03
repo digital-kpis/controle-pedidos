@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Pedidos por Turno</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #0B0E14; }
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  input[type=number]::-webkit-outer-spin-button,
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
+  ::selection { background: #F0A93A55; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+const DB_URL_KEY = "pedidos-turno:firebase-url";
+const CACHE_KEY = "pedidos-turno:cache";
+
+const SHIFTS = [
+  { key: "manha", label: "Manhã", range: "07h – 14h", color: "#F0A93A", start: 7, end: 14 },
+  { key: "tarde", label: "Tarde", range: "14h – 22h", color: "#E85D4A", start: 14, end: 22 },
+  { key: "noite", label: "Noite", range: "22h – 06h", color: "#5B6EF5", start: 22, end: 30 },
+];
+
+const emptyShiftData = () => ({ pedidos: "", operadores: "", valor: "" });
+const emptyDay = () => ({ manha: emptyShiftData(), tarde: emptyShiftData(), noite: emptyShiftData(), finalized: false });
+
+function todayISO() {
+  const d = new Date();
+  const tz = d.getTimezoneOffset();
+  return new Date(d.getTime() - tz * 60000).toISOString().slice(0, 10);
+}
+function fmtBRL(n) {
+  if (!isFinite(n)) return "R$ 0,00";
+  return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+function fmtDateLabel(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("pt-BR", { weekday: "short", day: "2-digit", month: "short" });
+}
+function num(v) {
+  const n = parseFloat(String(v).replace(",", "."));
+  return isNaN(n) ? 0 : n;
+}
+function last14Dates() {
+  const out = [];
+  const d = new Date();
+  for (let i = 0; i < 14; i++) out.push(new Date(d.getFullYear(), d.getMonth(), d.getDate() - i).toISOString().slice(0, 10));
+  return out;
+}
+function currentShiftKey() {
+  const h = new Date().getHours();
+  if (h >= 7 && h < 14) return "manha";
+  if (h >= 14 && h < 22) return "tarde";
+  return "noite";
+}
+function normalizeDbUrl(raw) {
+  let u = raw.trim();
+  if (!/^https?:\/\//.test(u)) u = "https://" + u;
+  return u.replace(/\/+$/, "");
+}
+
+// --- Firebase Realtime Database REST helpers ---
+async function fbFetchAll(dbUrl) {
+  const res = await fetch(`${dbUrl}/dias.json`);
+  if (!res.ok) throw new Error("Falha ao carregar dados");
+  const json = await res.json();
+  return json || {};
+}
+
+// Reads only the remote timestamp for one day, used to detect concurrent edits
+// before overwriting — without this, two people saving the same day at the
+// same time silently lose whichever save happened first.
+async function fbGetTimestamp(dbUrl, iso) {
+  try {
+    const res = await fetch(`${dbUrl}/dias/${iso}/atualizado_em.json`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function fbSaveDay(dbUrl, iso, day) {
+  const res = await fetch(`${dbUrl}/dias/${iso}.json`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...day, atualizado_em: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error("Falha ao salvar");
+  return res.json();
+}
+
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+function saveCache(map) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify(map));
+  } catch (e) {
+    // localStorage cheio ou indisponível — segue sem cache
+  }
+}
+
+// Aplica um evento de streaming do Firebase (put/patch) num path arbitrário
+// dentro do mapa local de dias, sem precisar rebuscar tudo do zero.
+function applyRealtimePatch(prev, path, data) {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length === 0) {
+    return data || {};
+  }
+  const iso = parts[0];
+  const next = { ...prev };
+  if (parts.length === 1) {
+    if (data === null || data === undefined) delete next[iso];
+    else next[iso] = data;
+    return next;
+  }
+  const existingDay = next[iso] ? { ...next[iso] } : {};
+  let cursor = existingDay;
+  for (let i = 1; i < parts.length - 1; i++) {
+    const key = parts[i];
+    cursor[key] = cursor[key] ? { ...cursor[key] } : {};
+    cursor = cursor[key];
+  }
+  const lastKey = parts[parts.length - 1];
+  if (data === null || data === undefined) delete cursor[lastKey];
+  else cursor[lastKey] = data;
+  next[iso] = existingDay;
+  return next;
+}
+
+// Abre uma conexão de streaming (Server-Sent Events) com o Realtime Database.
+// O navegador reconecta sozinho se a conexão cair.
+function connectRealtime(dbUrl, { onOpen, onUpdate, onError }) {
+  const es = new EventSource(`${dbUrl}/dias.json`);
+  es.addEventListener("put", (e) => {
+    try {
+      const { path, data } = JSON.parse(e.data);
+      onUpdate(path, data);
+    } catch (err) { /* ignora evento malformado */ }
+  });
+  es.addEventListener("patch", (e) => {
+    try {
+      const { path, data } = JSON.parse(e.data);
+      onUpdate(path, data);
+    } catch (err) { /* ignora evento malformado */ }
+  });
+  es.onopen = onOpen;
+  es.onerror = onError;
+  return es;
+}
+
+function App() {
+  const [dbUrl, setDbUrl] = useState(() => localStorage.getItem(DB_URL_KEY) || "");
+  const [urlDraft, setUrlDraft] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const [allData, setAllData] = useState({});
+  const [day, setDay] = useState(emptyDay());
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [offline, setOffline] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [showInfo, setShowInfo] = useState(false);
+  const [baselineTs, setBaselineTs] = useState(null);
+  const [dirty, setDirty] = useState(false);
+
+  const { useRef } = React;
+  const activeShift = currentShiftKey();
+  const flashToast = useCallback((msg) => { setToast(msg); setTimeout(() => setToast(null), 2200); }, []);
+
+  // O listener de tempo real é criado uma vez por conexão; usamos refs pra
+  // ele sempre enxergar o valor mais atual de "dirty" e "date" sem precisar
+  // recriar a conexão a cada tecla digitada.
+  const dirtyRef = useRef(dirty);
+  const dateRef = useRef(date);
+  useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
+  useEffect(() => { dateRef.current = date; }, [date]);
+
+  const refreshAll = useCallback(async (opts) => {
+    if (!dbUrl) return;
+    const silent = opts && opts.silent;
+    if (!silent) setLoading(true);
+    try {
+      const map = await fbFetchAll(dbUrl);
+      // Não sobrescreve o dia que está sendo editado agora, se houver
+      // alterações ainda não salvas — evita perder o que a pessoa digitou.
+      setAllData((prev) => {
+        if (dirty && silent) {
+          return { ...map, [date]: prev[date] };
+        }
+        return map;
+      });
+      saveCache(map);
+      setOffline(false);
+      setErrorMsg("");
+    } catch (e) {
+      const cached = loadCache();
+      if (Object.keys(cached).length > 0) {
+        setAllData((prev) => (silent ? prev : cached));
+        setOffline(true);
+        setErrorMsg("Sem conexão com o Firebase — mostrando os últimos dados salvos neste navegador.");
+      } else {
+        setErrorMsg("Não foi possível conectar ao Firebase. Verifique a URL do banco de dados.");
+      }
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [dbUrl, dirty, date]);
+
+  useEffect(() => { refreshAll(); }, [dbUrl]); // eslint-disable-line
+
+  // Conexão em tempo real via Server-Sent Events (REST streaming do Firebase).
+  // Assim que alguém salva um dia em qualquer navegador, este evento chega
+  // aqui sem precisar recarregar a página nem esperar o próximo polling.
+  useEffect(() => {
+    if (!dbUrl) return;
+    let es;
+    let cancelled = false;
+
+    const applyUpdate = (path, data) => {
+      setAllData((prev) => {
+        if (path === "/") {
+          const map = data || {};
+          if (dirtyRef.current) map[dateRef.current] = prev[dateRef.current];
+          saveCache(map);
+          return map;
+        }
+        const key = path.replace(/^\//, "").split("/")[0];
+        if (!key) return prev;
+        if (dirtyRef.current && key === dateRef.current) return prev;
+        const next = { ...prev };
+        if (data === null) delete next[key];
+        else next[key] = data;
+        saveCache(next);
+        return next;
+      });
+    };
+
+    try {
+      es = new EventSource(`${dbUrl}/dias.json`);
+      es.addEventListener("put", (e) => {
+        if (cancelled) return;
+        const { path, data } = JSON.parse(e.data);
+        applyUpdate(path, data);
+        setOffline(false);
+        setErrorMsg("");
+      });
+      es.addEventListener("patch", (e) => {
+        if (cancelled) return;
+        const { path, data } = JSON.parse(e.data);
+        applyUpdate(path, data);
+      });
+      es.onerror = () => {
+        if (cancelled) return;
+        setOffline(true);
+        setErrorMsg("Conexão em tempo real caiu — tentando reconectar…");
+        // EventSource tenta reconectar sozinho; se voltar, o próximo "put" já limpa o aviso
+      };
+    } catch (e) {
+      setErrorMsg("Este navegador não suporta atualização em tempo real. Use o botão Atualizar.");
+    }
+
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+    };
+  }, [dbUrl]);
+
+  useEffect(() => {
+    const loaded = allData[date] || emptyDay();
+    setDay(loaded);
+    setBaselineTs(loaded.atualizado_em || null);
+    setDirty(false);
+  }, [date]); // eslint-disable-line
+
+  const updateField = (shiftKey, field, value) => {
+    setDay((d) => ({ ...d, [shiftKey]: { ...d[shiftKey], [field]: value } }));
+    setDirty(true);
+  };
+
+  const persist = async (nextDay) => {
+    if (offline) {
+      flashToast("Sem conexão — não é possível salvar agora");
+      return;
+    }
+    setSaving(true);
+    try {
+      // Confere se alguém mais salvou este dia desde que carregamos —
+      // se sim, avisa antes de sobrescrever em vez de perder o lançamento alheio.
+      const remoteTs = await fbGetTimestamp(dbUrl, date);
+      if (baselineTs && remoteTs && remoteTs !== baselineTs) {
+        const proceed = window.confirm(
+          "Outra pessoa alterou este dia depois que você abriu a página.\n\n" +
+          "Clique OK para sobrescrever com os valores atuais da tela,\n" +
+          "ou Cancelar para recarregar os dados mais recentes antes de continuar."
+        );
+        if (!proceed) {
+          await refreshAll();
+          setSaving(false);
+          return;
+        }
+      }
+      await fbSaveDay(dbUrl, date, nextDay);
+      setAllData((m) => ({ ...m, [date]: { ...nextDay, atualizado_em: new Date().toISOString() } }));
+      setBaselineTs(new Date().toISOString());
+      setDirty(false);
+    } catch (e) {
+      flashToast("Erro ao salvar no Firebase");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSave = () => { persist(day); flashToast("Lançamento salvo"); };
+  const handleFinalize = () => {
+    if (!window.confirm("Fechar o dia consolida os valores. Deseja continuar?")) return;
+    const n = { ...day, finalized: true }; setDay(n); persist(n); flashToast("Dia fechado");
+  };
+  const handleReopen = () => { const n = { ...day, finalized: false }; setDay(n); persist(n); flashToast("Dia reaberto"); };
+
+  const totals = useMemo(() => {
+    let pedidos = 0, operadores = 0, valor = 0;
+    SHIFTS.forEach((s) => { pedidos += num(day[s.key].pedidos); operadores += num(day[s.key].operadores); valor += num(day[s.key].valor); });
+    return { pedidos, operadores, valor, ticket: pedidos > 0 ? valor / pedidos : 0 };
+  }, [day]);
+
+  const dates14 = last14Dates();
+  const weekTotals = useMemo(() => {
+    let pedidos = 0, valor = 0;
+    dates14.forEach((iso) => {
+      const d = allData[iso];
+      if (!d) return;
+      SHIFTS.forEach((s) => { pedidos += num(d[s.key].pedidos); valor += num(d[s.key].valor); });
+    });
+    return { pedidos, valor };
+  }, [allData]);
+
+  if (!dbUrl) {
+    return (
+      <div style={styles.page}>
+        <div style={styles.setupWrap}>
+          <div style={styles.eyebrow}>CONTROLE OPERACIONAL</div>
+          <h1 style={styles.title}>Pedidos por Turno</h1>
+          <p style={styles.setupText}>
+            Cole abaixo a URL do seu Realtime Database do Firebase
+            (algo como <code>https://SEU-PROJETO-default-rtdb.firebaseio.com</code>).
+            Isso fica salvo só neste navegador.
+          </p>
+          <input
+            type="text"
+            placeholder="https://seu-projeto-default-rtdb.firebaseio.com"
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            style={styles.setupInput}
+          />
+          <button
+            style={styles.saveBtn}
+            onClick={() => {
+              if (!urlDraft.trim()) return;
+              const clean = normalizeDbUrl(urlDraft);
+              localStorage.setItem(DB_URL_KEY, clean);
+              setDbUrl(clean);
+            }}
+          >
+            Conectar
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.wrap}>
+        <header style={styles.header}>
+          <div>
+            <div style={styles.eyebrow}>CONTROLE OPERACIONAL</div>
+            <h1 style={styles.title}>Pedidos por Turno</h1>
+          </div>
+          <div style={styles.dateBox}>
+            <label style={styles.dateLabel}>Dia</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={styles.dateInput} />
+          </div>
+        </header>
+
+        <div style={styles.timelineCard}>
+          <div style={styles.timelineTrack}>
+            {SHIFTS.map((s) => (
+              <div key={s.key} style={{ ...styles.timelineSeg, flexGrow: s.end - s.start, background: `linear-gradient(90deg, ${s.color}33, ${s.color}66)`, borderColor: s.color }}>
+                {activeShift === s.key && <span style={{ ...styles.nowDot, background: s.color }} />}
+              </div>
+            ))}
+          </div>
+          <div style={styles.timelineLabels}>
+            {SHIFTS.map((s) => (
+              <div key={s.key} style={{ flexGrow: s.end - s.start, textAlign: "center" }}>
+                <span style={{ color: s.color, fontWeight: 600 }}>{s.label}</span>
+                <span style={styles.timelineRange}> {s.range}</span>
+              </div>
+            ))}
+          </div>
+          <div style={styles.syncRow}>
+            <span style={styles.syncStatus}>
+              {loading ? "conectando…" : offline ? "⚠ modo offline" : "● ao vivo"}
+            </span>
+            <button style={styles.refreshBtn} onClick={() => refreshAll()} disabled={loading}>↻ Atualizar</button>
+          </div>
+          {errorMsg && <div style={styles.errorText}>{errorMsg}</div>}
+        </div>
+
+        {!loading && (
+          <>
+            {day.finalized && (
+              <div style={styles.finalizedBanner}>
+                <span>✓ Dia fechado — valores consolidados</span>
+                <button style={styles.linkBtn} onClick={handleReopen}>Reabrir</button>
+              </div>
+            )}
+
+            <div style={styles.grid}>
+              {SHIFTS.map((s) => {
+                const isNow = activeShift === s.key;
+                return (
+                  <div key={s.key} style={{ ...styles.card, borderTopColor: s.color, ...(isNow ? { boxShadow: `0 0 0 1px ${s.color}55, 0 8px 24px ${s.color}22` } : {}) }}>
+                    <div style={styles.cardHead}>
+                      <span style={{ ...styles.cardDot, background: s.color }} />
+                      <div style={{ flex: 1 }}>
+                        <div style={styles.cardTitle}>{s.label}</div>
+                        <div style={styles.cardRange}>{s.range}</div>
+                      </div>
+                      {isNow && <span style={{ ...styles.nowBadge, color: s.color, borderColor: s.color }}>● agora</span>}
+                    </div>
+                    <Field label="Pedidos" value={day[s.key].pedidos} onChange={(v) => updateField(s.key, "pedidos", v)} disabled={day.finalized} placeholder="0" />
+                    <Field label="Operadores" value={day[s.key].operadores} onChange={(v) => updateField(s.key, "operadores", v)} disabled={day.finalized} placeholder="0" />
+                    <Field label="Valor (R$)" value={day[s.key].valor} onChange={(v) => updateField(s.key, "valor", v)} disabled={day.finalized} placeholder="0,00" type="text" />
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={styles.totalsCard}>
+              <div style={styles.totalsTitle}>Total do dia</div>
+              <div style={styles.totalsGrid}>
+                <Total label="Pedidos" value={totals.pedidos} />
+                <Total label="Operador-turnos" value={totals.operadores} />
+                <Total label="Faturamento" value={fmtBRL(totals.valor)} mono />
+                <Total label="Ticket médio" value={fmtBRL(totals.ticket)} mono muted />
+              </div>
+              <div style={styles.breakdownTitle}>Detalhe por horário</div>
+              <div style={styles.breakdownList}>
+                {SHIFTS.map((s) => {
+                  const p = num(day[s.key].pedidos), op = num(day[s.key].operadores), v = num(day[s.key].valor);
+                  const pct = totals.pedidos > 0 ? Math.round((p / totals.pedidos) * 100) : 0;
+                  return (
+                    <div key={s.key} style={styles.breakdownRow}>
+                      <div style={{ ...styles.breakdownBar, width: `${Math.max(pct, 0)}%`, background: `linear-gradient(90deg, ${s.color}2E, ${s.color}14)` }} />
+                      <span style={{ ...styles.breakdownDot, background: s.color, position: "relative", zIndex: 1 }} />
+                      <span style={{ ...styles.breakdownLabel, position: "relative", zIndex: 1 }}>{s.label}</span>
+                      <span style={{ ...styles.breakdownRange, position: "relative", zIndex: 1 }}>{s.range}</span>
+                      <span style={{ ...styles.breakdownPedidos, position: "relative", zIndex: 1 }}>{p} pedidos</span>
+                      <span style={{ ...styles.breakdownPct, position: "relative", zIndex: 1 }}>{totals.pedidos > 0 ? `${pct}%` : "—"}</span>
+                      <span style={{ ...styles.breakdownOperadores, position: "relative", zIndex: 1 }}>{op} operador{op === 1 ? "" : "es"}</span>
+                      <span style={{ ...styles.breakdownValor, position: "relative", zIndex: 1 }}>{fmtBRL(v)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={styles.actions}>
+              <button style={styles.saveBtn} onClick={handleSave} disabled={saving || day.finalized || offline}>
+                {saving ? "Salvando…" : "Salvar lançamento"}
+              </button>
+              {!day.finalized && <button style={styles.finalizeBtn} onClick={handleFinalize} disabled={saving || offline}>Fechar dia</button>}
+            </div>
+          </>
+        )}
+
+        <section style={styles.historySection}>
+          <div style={styles.historyHead}>
+            <h2 style={styles.historyTitle}>Últimos 14 dias</h2>
+            <div style={styles.historySummary}>{weekTotals.pedidos} pedidos · {fmtBRL(weekTotals.valor)}</div>
+          </div>
+
+          <div style={styles.filterRow}>
+            <label style={styles.filterLabel}>Ir para uma data específica</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={styles.filterInput} />
+          </div>
+
+          <TrendChart dates={dates14} allData={allData} selectedDate={date} onSelect={setDate} />
+
+          <div style={styles.historyList}>
+            {dates14.map((iso) => {
+              const d = allData[iso];
+              const dayTotal = d ? SHIFTS.reduce((a, s) => a + num(d[s.key].pedidos), 0) : null;
+              const dayValor = d ? SHIFTS.reduce((a, s) => a + num(d[s.key].valor), 0) : null;
+              const isSelected = iso === date;
+              return (
+                <button key={iso} onClick={() => setDate(iso)} style={{ ...styles.historyRow, ...(isSelected ? styles.historyRowActive : {}) }}>
+                  <span style={styles.historyDate}>{fmtDateLabel(iso)}</span>
+                  {d ? (
+                    <>
+                      <span style={styles.historyPedidos}>{dayTotal} pedidos</span>
+                      <span style={styles.historyValor}>{fmtBRL(dayValor)}</span>
+                      <span style={{ ...styles.historyStatus, color: d.finalized ? "#34C77B" : "#9CA5B4" }}>{d.finalized ? "fechado" : "aberto"}</span>
+                    </>
+                  ) : (
+                    <span style={styles.historyEmpty}>sem lançamento</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <footer style={styles.footer}>
+          <button style={styles.footerLink} onClick={() => setShowInfo((v) => !v)}>
+            {showInfo ? "ocultar aviso" : "sobre os dados"}
+          </button>
+          {" · "}
+          <button
+            style={styles.footerLink}
+            onClick={() => { localStorage.removeItem(DB_URL_KEY); setDbUrl(""); }}
+          >
+            trocar banco de dados
+          </button>
+          {showInfo && (
+            <p style={styles.footerText}>
+              Os lançamentos ficam salvos num banco de dados Firebase compartilhado.
+              Qualquer pessoa com o link desta página pode conferir e preencher os dados,
+              e as mudanças aparecem ao vivo pra quem estiver com a página aberta. O botão
+              "Atualizar" força uma nova sincronização caso a conexão em tempo real caia.
+            </p>
+          )}
+        </footer>
+      </div>
+
+      {toast && <div style={styles.toast}>{toast}</div>}
+    </div>
+  );
+}
+
+function TrendChart({ dates, allData, selectedDate, onSelect }) {
+  const chronological = [...dates].reverse(); // mais antigo -> mais recente
+  const totalsByDate = chronological.map((iso) => {
+    const d = allData[iso];
+    const perShift = SHIFTS.map((s) => (d ? num(d[s.key].pedidos) : 0));
+    return { iso, perShift, total: perShift.reduce((a, b) => a + b, 0), hasData: !!d, finalized: d ? d.finalized : false };
+  });
+  const max = Math.max(1, ...totalsByDate.map((t) => t.total));
+  const chartH = 84;
+
+  return (
+    <div style={styles.trendCard}>
+      <div style={styles.trendHead}>
+        <span style={styles.trendTitle}>Tendência — pedidos por dia</span>
+        <div style={styles.trendLegend}>
+          {SHIFTS.map((s) => (
+            <span key={s.key} style={styles.trendLegendItem}>
+              <span style={{ ...styles.trendLegendDot, background: s.color }} />
+              {s.label}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div style={styles.trendBars}>
+        {totalsByDate.map((t) => {
+          const isSelected = t.iso === selectedDate;
+          const barH = t.hasData ? Math.max(4, (t.total / max) * chartH) : 3;
+          return (
+            <button
+              key={t.iso}
+              onClick={() => onSelect(t.iso)}
+              title={`${fmtDateLabel(t.iso)} — ${t.total} pedidos`}
+              style={styles.trendBarBtn}
+            >
+              <div style={{ ...styles.trendBarStack, height: chartH }}>
+                {t.hasData ? (
+                  <div style={{ ...styles.trendBarFill, height: barH, opacity: isSelected ? 1 : 0.75 }}>
+                    {SHIFTS.map((s, i) => {
+                      const v = t.perShift[i];
+                      const segH = t.total > 0 ? (v / t.total) * barH : 0;
+                      return <div key={s.key} style={{ height: segH, background: s.color, width: "100%" }} />;
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ ...styles.trendBarEmpty, height: barH }} />
+                )}
+              </div>
+              <span style={{ ...styles.trendBarLabel, ...(isSelected ? { color: "#F0A93A", fontWeight: 700 } : {}) }}>
+                {fmtDateLabel(t.iso).slice(0, 3)}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, value, onChange, disabled, placeholder, type }) {
+  const isText = type === "text";
+  return (
+    <label style={styles.fieldLabel}>
+      {label}
+      <input
+        type={isText ? "text" : "number"}
+        inputMode="decimal"
+        step={isText ? undefined : "1"}
+        min={isText ? undefined : "0"}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => {
+          const v = e.target.value;
+          // No campo de valor (texto), aceita só dígitos, vírgula e ponto
+          onChange(isText ? v.replace(/[^0-9.,]/g, "") : v);
+        }}
+        style={{ ...styles.fieldInput, ...(disabled ? styles.fieldInputDisabled : {}) }}
+      />
+    </label>
+  );
+}
+function Total({ label, value, mono, muted }) {
+  return (
+    <div style={styles.totalItem}>
+      <div style={styles.totalLabel}>{label}</div>
+      <div style={{ ...styles.totalValue, ...(mono ? { fontFamily: "'JetBrains Mono', monospace" } : {}), ...(muted ? { color: "#9CA5B4" } : {}) }}>{value}</div>
+    </div>
+  );
+}
+
+const styles = {
+  page: { minHeight: "100vh", background: "#0B0E14", color: "#EAEDF3", fontFamily: "'Inter', system-ui, sans-serif", padding: "24px 16px 60px" },
+  wrap: { maxWidth: 720, margin: "0 auto" },
+  setupWrap: { maxWidth: 440, margin: "80px auto", textAlign: "center" },
+  setupText: { color: "#9CA5B4", fontSize: 14, lineHeight: 1.5, margin: "14px 0 20px" },
+  setupInput: { width: "100%", background: "#171C27", border: "1px solid #232A38", borderRadius: 9, color: "#EAEDF3", padding: "12px 14px", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", marginBottom: 14 },
+  header: { display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 20, gap: 12, flexWrap: "wrap" },
+  eyebrow: { fontSize: 11, letterSpacing: "0.14em", color: "#5C6577", fontWeight: 600, marginBottom: 4 },
+  title: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 26, fontWeight: 700, margin: 0, letterSpacing: "-0.01em" },
+  dateBox: { display: "flex", flexDirection: "column", gap: 4 },
+  dateLabel: { fontSize: 11, color: "#5C6577", fontWeight: 600 },
+  dateInput: { background: "#171C27", border: "1px solid #232A38", borderRadius: 8, color: "#EAEDF3", padding: "8px 10px", fontSize: 14, fontFamily: "'JetBrains Mono', monospace" },
+  timelineCard: { background: "#12161F", border: "1px solid #232A38", borderRadius: 14, padding: "16px 16px 12px", marginBottom: 20 },
+  timelineTrack: { display: "flex", height: 10, borderRadius: 6, overflow: "hidden", gap: 2 },
+  timelineSeg: { position: "relative", borderBottom: "2px solid", borderRadius: 4 },
+  nowDot: { position: "absolute", top: -3, left: "50%", transform: "translateX(-50%)", width: 6, height: 6, borderRadius: "50%", boxShadow: "0 0 0 4px #0B0E14" },
+  timelineLabels: { display: "flex", marginTop: 8, fontSize: 12 },
+  timelineRange: { color: "#5C6577", fontSize: 11 },
+  syncRow: { display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14, paddingTop: 12, borderTop: "1px solid #1B212E" },
+  syncStatus: { fontSize: 11, color: "#5C6577", fontFamily: "'JetBrains Mono', monospace" },
+  refreshBtn: { background: "none", border: "1px solid #232A38", color: "#9CA5B4", borderRadius: 7, padding: "4px 10px", fontSize: 11, cursor: "pointer" },
+  errorText: { color: "#E85D4A", fontSize: 12, marginTop: 8 },
+  finalizedBanner: { background: "#12261C", border: "1px solid #1E4630", color: "#34C77B", borderRadius: 10, padding: "10px 14px", fontSize: 13, fontWeight: 600, display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 },
+  linkBtn: { background: "none", border: "none", color: "#34C77B", textDecoration: "underline", cursor: "pointer", fontSize: 13, fontWeight: 600, padding: 0 },
+  grid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12, marginBottom: 16 },
+  card: { background: "#12161F", border: "1px solid #232A38", borderTop: "3px solid", borderRadius: 12, padding: 16 },
+  cardHead: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 },
+  cardDot: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0 },
+  cardTitle: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 15 },
+  cardRange: { fontSize: 11, color: "#5C6577", fontFamily: "'JetBrains Mono', monospace" },
+  fieldLabel: { display: "block", fontSize: 11, color: "#9CA5B4", fontWeight: 600, marginBottom: 6, marginTop: 12 },
+  fieldInput: { width: "100%", background: "#0B0E14", border: "1px solid #232A38", borderRadius: 8, color: "#EAEDF3", padding: "9px 10px", fontSize: 15, fontFamily: "'JetBrains Mono', monospace", outline: "none" },
+  fieldInputDisabled: { opacity: 0.5, cursor: "not-allowed" },
+  totalsCard: { background: "#171C27", border: "1px solid #232A38", borderRadius: 12, padding: 16, marginBottom: 16 },
+  totalsTitle: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 14, marginBottom: 12, color: "#9CA5B4" },
+  totalsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 12 },
+  totalItem: {},
+  totalLabel: { fontSize: 11, color: "#5C6577", marginBottom: 4, fontWeight: 600 },
+  totalValue: { fontSize: 20, fontWeight: 700, fontFamily: "'Space Grotesk', sans-serif" },
+  breakdownTitle: { fontSize: 11, color: "#5C6577", fontWeight: 600, marginTop: 20, marginBottom: 8, paddingTop: 16, borderTop: "1px solid #232A38" },
+  breakdownList: { display: "flex", flexDirection: "column", gap: 6 },
+  breakdownRow: { position: "relative", overflow: "hidden", display: "flex", alignItems: "center", gap: 10, background: "#0B0E14", border: "1px solid #232A38", borderRadius: 8, padding: "8px 12px", fontSize: 12.5, flexWrap: "wrap" },
+  breakdownBar: { position: "absolute", top: 0, left: 0, bottom: 0, borderRadius: 8, transition: "width 0.3s ease" },
+  nowBadge: { fontSize: 10, fontWeight: 700, border: "1px solid", borderRadius: 20, padding: "3px 8px", letterSpacing: "0.03em", flexShrink: 0 },
+  trendCard: { background: "#12161F", border: "1px solid #232A38", borderRadius: 12, padding: "14px 16px 10px", marginBottom: 14 },
+  trendHead: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 },
+  trendTitle: { fontSize: 12, color: "#9CA5B4", fontWeight: 600 },
+  trendLegend: { display: "flex", gap: 12 },
+  trendLegendItem: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "#5C6577" },
+  trendLegendDot: { width: 6, height: 6, borderRadius: "50%", display: "inline-block" },
+  trendBars: { display: "flex", alignItems: "flex-end", gap: 4, height: 108, overflowX: "auto", paddingBottom: 2 },
+  trendBarBtn: { background: "none", border: "none", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, padding: "0 2px", minWidth: 22, flex: "1 1 0" },
+  trendBarStack: { display: "flex", alignItems: "flex-end", width: "100%" },
+  trendBarFill: { display: "flex", flexDirection: "column-reverse", width: "100%", borderRadius: "3px 3px 0 0", overflow: "hidden" },
+  trendBarEmpty: { width: "100%", background: "#1B212E", borderRadius: "3px 3px 0 0" },
+  trendBarLabel: { fontSize: 9.5, color: "#5C6577", fontFamily: "'JetBrains Mono', monospace", textTransform: "lowercase" },
+  breakdownDot: { width: 7, height: 7, borderRadius: "50%", flexShrink: 0 },
+  breakdownLabel: { fontWeight: 600, minWidth: 46 },
+  breakdownRange: { color: "#5C6577", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, minWidth: 76 },
+  breakdownPedidos: { fontFamily: "'JetBrains Mono', monospace", minWidth: 66 },
+  breakdownPct: { color: "#5C6577", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, minWidth: 34 },
+  breakdownOperadores: { color: "#9CA5B4", fontFamily: "'JetBrains Mono', monospace", fontSize: 11, minWidth: 84 },
+  breakdownValor: { marginLeft: "auto", fontFamily: "'JetBrains Mono', monospace", color: "#F0A93A", fontWeight: 600 },
+  filterRow: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14, background: "#12161F", border: "1px solid #232A38", borderRadius: 9, padding: "10px 14px", flexWrap: "wrap" },
+  filterLabel: { fontSize: 12, color: "#9CA5B4", fontWeight: 600 },
+  filterInput: { background: "#0B0E14", border: "1px solid #232A38", borderRadius: 7, color: "#EAEDF3", padding: "6px 10px", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", marginLeft: "auto" },
+  actions: { display: "flex", gap: 10, marginBottom: 32, flexWrap: "wrap" },
+  saveBtn: { background: "#F0A93A", color: "#0B0E14", border: "none", borderRadius: 9, padding: "12px 20px", fontWeight: 700, fontSize: 14, cursor: "pointer", flex: "1 1 auto" },
+  finalizeBtn: { background: "transparent", color: "#34C77B", border: "1px solid #1E4630", borderRadius: 9, padding: "12px 20px", fontWeight: 700, fontSize: 14, cursor: "pointer" },
+  historySection: { marginTop: 8 },
+  historyHead: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10, flexWrap: "wrap", gap: 8 },
+  historyTitle: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 16, fontWeight: 600, margin: 0 },
+  historySummary: { fontSize: 12, color: "#5C6577", fontFamily: "'JetBrains Mono', monospace" },
+  historyList: { display: "flex", flexDirection: "column", gap: 6 },
+  historyRow: { display: "flex", alignItems: "center", gap: 12, background: "#12161F", border: "1px solid #232A38", borderRadius: 9, padding: "10px 14px", cursor: "pointer", color: "#EAEDF3", fontSize: 13, textAlign: "left", width: "100%" },
+  historyRowActive: { borderColor: "#F0A93A", background: "#1A160F" },
+  historyDate: { width: 90, color: "#9CA5B4", fontWeight: 600, flexShrink: 0 },
+  historyPedidos: { flex: 1, fontFamily: "'JetBrains Mono', monospace" },
+  historyValor: { fontFamily: "'JetBrains Mono', monospace", color: "#F0A93A", minWidth: 90, textAlign: "right" },
+  historyStatus: { fontSize: 11, fontWeight: 600, minWidth: 54, textAlign: "right" },
+  historyEmpty: { color: "#5C6577", fontStyle: "italic", flex: 1 },
+  footer: { marginTop: 28, textAlign: "center" },
+  footerLink: { background: "none", border: "none", color: "#5C6577", fontSize: 12, cursor: "pointer", textDecoration: "underline" },
+  footerText: { fontSize: 12, color: "#5C6577", maxWidth: 420, margin: "8px auto 0" },
+  toast: { position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)", background: "#171C27", border: "1px solid #232A38", color: "#EAEDF3", padding: "10px 18px", borderRadius: 9, fontSize: 13, boxShadow: "0 8px 24px rgba(0,0,0,0.4)" },
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+<script>
+  (function () {
+    var code = document.getElementById("app-source").textContent;
+    var output = Babel.transform(code, {
+      presets: ["react"],
+      sourceType: "script",
+    }).code;
+    var s = document.createElement("script");
+    s.textContent = output;
+    document.body.appendChild(s);
+  })();
+</script>
+</body>
+</html>
