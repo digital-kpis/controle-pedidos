@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Pedidos Diários por Turno</title>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <style>
   :root{
     --bg: #0f1115;
@@ -170,15 +172,12 @@
 
   <div class="card">
     <details>
-      <summary>Configurar sincronização (Firebase, opcional)</summary>
+      <summary>Sobre a sincronização</summary>
       <div class="cfg">
-        Por padrão os dados ficam salvos apenas neste navegador (<code>localStorage</code>).
-        Para sincronizar entre dispositivos/turnos em tempo real, crie um projeto no
-        <a href="https://console.firebase.google.com" target="_blank" style="color:var(--accent)">Firebase Console</a>,
-        ative o <b>Firestore Database</b> (modo produção) e preencha o objeto
-        <code>FIREBASE_CONFIG</code> no início do script deste arquivo com as credenciais do seu
-        app web (Configurações do projeto → Seus apps → SDK do Firebase).
-        Sem isso o dashboard funciona normalmente, só que só neste aparelho.
+        Os dados são salvos automaticamente no banco compartilhado do PAINEL (Firebase, projeto
+        <code>escala-dinamica</code>), então sincronizam em tempo real entre dispositivos e turnos.
+        Uma cópia também fica salva neste navegador (<code>localStorage</code>) como reforço,
+        caso fique sem internet por um instante.
       </div>
     </details>
   </div>
@@ -186,16 +185,15 @@
 </div>
 
 <script>
-// ====== CONFIG FIREBASE (opcional) ======
-// Preencha para habilitar sincronização entre dispositivos.
-// Deixe em branco para funcionar apenas com localStorage.
+// ====== Firebase (banco compartilhado do PAINEL: escala-dinamica) ======
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyCynjC_UcFKYLnp-mGt_yQlJwKZQj50wQI",
-  authDomain: "pedidos-diarios-2ccd8.firebaseapp.com",
-  projectId: "pedidos-diarios-2ccd8",
-  storageBucket: "pedidos-diarios-2ccd8.firebasestorage.app",
-  messagingSenderId: "784101137247",
-  appId: "1:784101137247:web:57a9fc27d1ce1cb9c474ea"
+  apiKey: "AIzaSyD2qYaUrjyFoJgfNLRTBg-b2t9Yr9GSB3A",
+  authDomain: "escala-dinamica.firebaseapp.com",
+  databaseURL: "https://escala-dinamica-default-rtdb.firebaseio.com",
+  projectId: "escala-dinamica",
+  storageBucket: "escala-dinamica.firebasestorage.app",
+  messagingSenderId: "896362898729",
+  appId: "1:896362898729:web:443ef1f568fc709bf3c338"
 };
 // =========================================
 
@@ -206,9 +204,8 @@ const TURNOS = [
 ];
 
 const STORAGE_KEY = "pedidos_diarios_v1";
-const COLLECTION = "pedidos_diarios";
+const FB_PATH = "controle_pedidos";
 let db = null;
-let fs = null; // funções do Firestore (setDoc, deleteDoc, onSnapshot, etc.)
 
 function todayISO(){
   const d = new Date();
@@ -325,7 +322,7 @@ window.excluirDia = async function(d){
   renderHistory();
   if(db){
     try{
-      await fs.deleteDoc(fs.doc(db, COLLECTION, d));
+      await db.ref(FB_PATH + '/' + d).remove();
     }catch(e){ console.error('Erro ao excluir no Firebase:', e); }
   }
 };
@@ -343,9 +340,9 @@ async function salvarDia(){
 
   if(db){
     try{
-      await fs.setDoc(fs.doc(db, COLLECTION, entry.data), {
+      await db.ref(FB_PATH + '/' + entry.data).set({
         turnos: entry.turnos,
-        updatedAt: fs.serverTimestamp()
+        updatedAt: firebase.database.ServerValue.TIMESTAMP
       });
     }catch(e){ console.error('Erro ao sincronizar com Firebase:', e); }
   }
@@ -357,42 +354,36 @@ function limparCampos(){
   recalc();
 }
 
-async function initFirebase(){
+function initFirebase(){
   const dot = document.getElementById('syncDot');
   const text = document.getElementById('syncText');
-  if(!FIREBASE_CONFIG.apiKey || !FIREBASE_CONFIG.projectId){
-    dot.className = 'dot off';
-    text.textContent = 'local apenas';
-    return;
-  }
   try{
-    const [{ initializeApp }, firestore] = await Promise.all([
-      import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js'),
-      import('https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js')
-    ]);
-    fs = firestore;
-    const app = initializeApp(FIREBASE_CONFIG);
-    db = fs.getFirestore(app);
+    firebase.initializeApp(FIREBASE_CONFIG);
+    db = firebase.database();
 
-    dot.className = 'dot on';
-    text.textContent = 'sincronizado';
+    db.ref('.info/connected').on('value', snap => {
+      if(snap.val()){
+        dot.className = 'dot on';
+        text.textContent = 'sincronizado';
+      }else{
+        dot.className = 'dot off';
+        text.textContent = 'sem conexão';
+      }
+    });
 
     // escuta em tempo real: qualquer lançamento (deste ou de outro aparelho) atualiza a tela
-    fs.onSnapshot(fs.collection(db, COLLECTION), snapshot => {
+    db.ref(FB_PATH).on('value', snapshot => {
+      const remote = snapshot.val() || {};
       const all = loadAll();
-      snapshot.docChanges().forEach(change => {
-        const d = change.doc.id;
-        if(change.type === 'removed'){
-          delete all[d];
-        } else {
-          const data = change.doc.data();
-          all[d] = { data: d, turnos: data.turnos };
-        }
+      // remove localmente o que não existe mais remotamente
+      Object.keys(all).forEach(d => { if(!remote[d]) delete all[d]; });
+      Object.keys(remote).forEach(d => {
+        all[d] = { data: d, turnos: remote[d].turnos };
       });
       saveAll(all);
       renderHistory();
     }, err => {
-      console.error('Erro no listener do Firestore:', err);
+      console.error('Erro no listener do Firebase:', err);
       dot.className = 'dot off';
       text.textContent = 'erro de sincronização';
     });
